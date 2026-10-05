@@ -20,7 +20,7 @@ class CycleDetectedException extends RuntimeException
 
     public function __construct(private readonly object $startNode)
     {
-        parent::__construct('A cycle has been detected, so a topological sort is not possible. The getCycle() method provides the list of nodes that form the cycle.');
+        parent::__construct('A cycle has been detected, so a topological sort is not possible. The getCycle() method provides the list of nodes that form the cycle. The cycle could not be broken by skipping an optional edge, because the edges of the cycle are non-nullable: making one of the underlying associations optional (a nullable join column) would allow the cycle to be broken; when the cycle involves the order of deletions, declaring a database-level ON DELETE SET NULL on the corresponding foreign key achieves the same effect.');
 
         $this->cycle = [$startNode];
     }

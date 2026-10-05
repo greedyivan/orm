@@ -263,6 +263,38 @@ class TopologicalSortTest extends OrmTestCase
         }
     }
 
+    public function testSkippedEdgesReportedWhenCycleIsBroken(): void
+    {
+        // Same constellation as testCycleRemovedByEliminatingLastOptionalEdge:
+        // the cycle can only be broken by skipping the two optional edges
+        // leaving B, so exactly those two edges are reported as skipped.
+        $this->addNodes('A', 'B', 'C', 'D');
+
+        $this->addEdge('A', 'B', true);
+        $this->addEdge('B', 'C', true);
+        $this->addEdge('C', 'A');
+        $this->addEdge('B', 'D', true);
+        $this->addEdge('D', 'A');
+
+        self::assertSame(['B', 'A', 'C', 'D'], $this->computeResult());
+        self::assertSame(
+            [[$this->nodes['B'], $this->nodes['C']], [$this->nodes['B'], $this->nodes['D']]],
+            $this->topologicalSort->getSkippedEdges(),
+        );
+    }
+
+    public function testNoSkippedEdgesWithoutCycle(): void
+    {
+        // Optional edges that are not part of a cycle are never skipped.
+        $this->addNodes('A', 'B', 'C');
+
+        $this->addEdge('A', 'B', true);
+        $this->addEdge('B', 'C', true);
+
+        self::assertSame(['C', 'B', 'A'], $this->computeResult());
+        self::assertSame([], $this->topologicalSort->getSkippedEdges());
+    }
+
     private function addNodes(string ...$names): void
     {
         foreach ($names as $name) {

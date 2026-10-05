@@ -55,6 +55,14 @@ final class TopologicalSort
      */
     private array $sortResult = [];
 
+    /**
+     * The edges that have been skipped to break cycles during the sort, as
+     * pairs of [outgoing node, incoming node].
+     *
+     * @var list<array{object, object}>
+     */
+    private array $skippedEdges = [];
+
     public function addNode(object $node): void
     {
         $id                = spl_object_id($node);
@@ -103,6 +111,19 @@ final class TopologicalSort
         return $this->sortResult;
     }
 
+    /**
+     * Returns the edges the sort has skipped in order to break cycles: each
+     * entry is a pair of [outgoing node, incoming node] — when ordering the
+     * result from left to right, all unskipped edges point to the left, while
+     * a skipped edge no longer constrains the position of its incoming node.
+     *
+     * @return list<array{object, object}>
+     */
+    public function getSkippedEdges(): array
+    {
+        return $this->skippedEdges;
+    }
+
     private function visit(int $oid): void
     {
         if ($this->states[$oid] === self::IN_PROGRESS) {
@@ -133,6 +154,8 @@ final class TopologicalSort
                     // The current edge is part of a cycle, but it is optional and the closest
                     // such edge while backtracking. Break the cycle here by skipping the edge
                     // and continuing with the next one.
+                    $this->skippedEdges[] = [$this->nodes[$oid], $this->nodes[$adjacentId]];
+
                     continue;
                 }
 

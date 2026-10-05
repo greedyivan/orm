@@ -211,6 +211,24 @@ class UnitOfWork implements PropertyChangedListener
     private array $entityDeletions = [];
 
     /**
+     * Foreign key columns to be set to NULL before the deletions of the
+     * current commit step run: when the delete order computation breaks a
+     * cycle at a nullable association edge, the row referencing across that
+     * edge would violate the foreign key constraint once the depended-upon
+     * row is deleted first — an UPDATE writing NULL to the column removes
+     * the edge from the database's point of view.
+     *
+     * This is the delete-side counterpart of the extra updates above: the
+     * records are planned by computeDeleteExecutionOrder() and executed at
+     * the head of executeDeletions(), so both deletion steps of a commit
+     * (the early deletions and the regular ones) are covered by the same
+     * mechanism.
+     *
+     * @phpstan-var array<int, array{object, array<string, array{mixed, mixed}>}>
+     */
+    private array $foreignKeyNullUpdates = [];
+
+    /**
      * New entities that were discovered through relationships that were not
      * marked as cascade-persist. During flush, this array is populated and
      * then pruned of any entities that were discovered through a valid
@@ -532,6 +550,7 @@ class UnitOfWork implements PropertyChangedListener
         $this->entityUpdates                           =
         $this->entityDeletions                         =
         $this->extraUpdates                            =
+        $this->foreignKeyNullUpdates                   =
         $this->collectionUpdates                       =
         $this->nonCascadedNewDetectedEntities          =
         $this->collectionDeletions                     =
@@ -572,6 +591,24 @@ class UnitOfWork implements PropertyChangedListener
         }
 
         $this->extraUpdates = [];
+    }
+
+    /**
+     * Executes the foreign key NULL updates planned by the delete order
+     * computation: every cycle edge the topological sort has skipped is
+     * compensated by an UPDATE removing the referencing foreign key, run
+     * before the DELETE statements of the current deletion step.
+     */
+    private function executeForeignKeyNullUpdates(): void
+    {
+        foreach ($this->foreignKeyNullUpdates as $oid => $update) {
+            [$entity, $changeset] = $update;
+
+            $this->entityChangeSets[$oid] = $changeset;
+            $this->buildEntityPersister($this->em->getClassMetadata($entity::class))->update($entity);
+        }
+
+        $this->foreignKeyNullUpdates = [];
     }
 
     /**
@@ -1376,6 +1413,14 @@ class UnitOfWork implements PropertyChangedListener
         $entities         = $this->computeDeleteExecutionOrder($deletions);
         $eventsToDispatch = [];
 
+        // The delete order computation may have broken cycles at nullable
+        // association edges: write the planned NULL foreign keys before any
+        // DELETE of this step, so that no deletion violates the constraint
+        // of an edge that was skipped.
+        if ($this->foreignKeyNullUpdates) {
+            $this->executeForeignKeyNullUpdates();
+        }
+
         foreach ($entities as $entity) {
             $this->removeFromIdentityMap($entity);
 
@@ -1515,6 +1560,14 @@ class UnitOfWork implements PropertyChangedListener
         $stronglyConnectedComponents = new StronglyConnectedComponents();
         $sort                        = new TopologicalSort();
 
+        // The nullable association edges fed to the sort, remembered by the
+        // pair of components they connect: when the sort reports an edge as
+        // skipped (cycle broken there), every association that fed the edge
+        // has to be compensated by a NULL foreign key write. Since a
+        // non-optional edge dominates its pair in the sort, an edge can only
+        // be skipped when every association feeding it is nullable.
+        $nullableEdgeOrigins = [];
+
         $deletions ??= $this->entityDeletions;
 
         foreach ($deletions as $entity) {
@@ -1616,13 +1669,33 @@ class UnitOfWork implements PropertyChangedListener
                 // The dependency direction implies that "$targetEntityComponent depends on $entityComponent
                 // being deleted first". The topological sort will output the depended-upon nodes first,
                 // so we can work through the result in the returned order.
+                //
+                // In line with the commit order computation for insertions, an edge backed by a
+                // nullable join column is optional: when such an edge is part of a cycle, the sort
+                // may break the cycle by skipping it. The referencing row then has to lose the
+                // foreign key before the depended-upon row is deleted, which is planned through
+                // the foreign key NULL updates once the sort reports the skipped edges.
                 if ($targetEntityComponent !== $entityComponent) {
-                    $sort->addEdge($targetEntityComponent, $entityComponent, false);
+                    $isNullable = ! isset($joinColumns->nullable) || $joinColumns->nullable;
+
+                    $sort->addEdge($targetEntityComponent, $entityComponent, $isNullable);
+
+                    if ($isNullable) {
+                        $nullableEdgeOrigins[spl_object_id($targetEntityComponent)][spl_object_id($entityComponent)][] = [$entity, $assoc->fieldName];
+                    }
                 }
             }
         }
 
-        return $sort->sort();
+        $entities = $sort->sort();
+
+        foreach ($sort->getSkippedEdges() as [$fromComponent, $toComponent]) {
+            foreach ($nullableEdgeOrigins[spl_object_id($fromComponent)][spl_object_id($toComponent)] ?? [] as [$entity, $fieldName]) {
+                $this->scheduleForeignKeyNullUpdate($entity, $fieldName);
+            }
+        }
+
+        return $entities;
     }
 
     /**
@@ -1712,6 +1785,32 @@ class UnitOfWork implements PropertyChangedListener
         }
 
         $this->extraUpdates[$oid] = $extraUpdate;
+    }
+
+    /**
+     * Schedules a foreign key column write of NULL for an entity that is
+     * about to be deleted: called by computeDeleteExecutionOrder() for every
+     * association edge the topological sort has skipped to break a cycle.
+     *
+     * Mirrors scheduleExtraUpdate(): records for the same entity are merged
+     * by object id, so exactly one UPDATE is planned per entity even when
+     * several of its associations cross broken cycle edges.
+     *
+     * @param string $fieldName the association field backed by the nullable join column
+     */
+    private function scheduleForeignKeyNullUpdate(object $entity, string $fieldName): void
+    {
+        $oid       = spl_object_id($entity);
+        $oldValue  = $this->em->getClassMetadata($entity::class)->getFieldValue($entity, $fieldName);
+        $changeset = [$fieldName => [$oldValue, null]];
+
+        if (isset($this->foreignKeyNullUpdates[$oid])) {
+            [, $changeset2] = $this->foreignKeyNullUpdates[$oid];
+
+            $changeset += $changeset2;
+        }
+
+        $this->foreignKeyNullUpdates[$oid] = [$entity, $changeset];
     }
 
     /**
@@ -2555,6 +2654,7 @@ class UnitOfWork implements PropertyChangedListener
         $this->collectionDeletions                     =
         $this->collectionUpdates                       =
         $this->extraUpdates                            =
+        $this->foreignKeyNullUpdates                   =
         $this->readOnlyObjects                         =
         $this->partialObjectLoadedFields               =
         $this->pendingCollectionElementRemovals        =
@@ -3249,14 +3349,8 @@ class UnitOfWork implements PropertyChangedListener
             return $this->persisters[$entityName];
         }
 
-        $class = $this->em->getClassMetadata($entityName);
-
-        $persister = match (true) {
-            $class->isInheritanceTypeNone() => new BasicEntityPersister($this->em, $class),
-            $class->isInheritanceTypeSingleTable() => new SingleTablePersister($this->em, $class),
-            $class->isInheritanceTypeJoined() => new JoinedSubclassPersister($this->em, $class),
-            default => throw new RuntimeException('No persister found for entity.'),
-        };
+        $class     = $this->em->getClassMetadata($entityName);
+        $persister = $this->buildEntityPersister($class);
 
         if ($this->hasCache && $class->cache !== null) {
             $persister = $this->em->getConfiguration()
@@ -3268,6 +3362,27 @@ class UnitOfWork implements PropertyChangedListener
         $this->persisters[$entityName] = $persister;
 
         return $this->persisters[$entityName];
+    }
+
+    /**
+     * Builds an entity persister without the second level cache wrapping.
+     *
+     * Used for the foreign key NULL updates of the delete path: their rows
+     * are deleted within the same commit step, so registering them in a
+     * cached persister's update queue would resolve their — by then removed —
+     * identifiers after the transaction; the deletions themselves evict the
+     * cache entries of those rows.
+     *
+     * @param ClassMetadata<object> $class
+     */
+    private function buildEntityPersister(ClassMetadata $class): EntityPersister
+    {
+        return match (true) {
+            $class->isInheritanceTypeNone() => new BasicEntityPersister($this->em, $class),
+            $class->isInheritanceTypeSingleTable() => new SingleTablePersister($this->em, $class),
+            $class->isInheritanceTypeJoined() => new JoinedSubclassPersister($this->em, $class),
+            default => throw new RuntimeException('No persister found for entity.'),
+        };
     }
 
     /** Gets a collection persister for a collection-valued association. */

@@ -290,6 +290,20 @@ The return type of the following methods has been changed from
 All three methods continue to return an instance of `EventManager`, however
 relying on that is deprecated and will no longer be the guaranteed in 4.0.
 
+## Potential changes to the order in which `DELETE`s are executed
+
+The delete order computation now treats an association edge backed by a
+nullable join column as optional, in the same way the commit order computation
+for insertions does. When such an edge is part of a cycle of pending
+deletions, the cycle is no longer rejected with a
+`Doctrine\ORM\Internal\TopologicalSort\CycleDetectedException`: instead, the
+cycle is broken at that edge, and an additional `UPDATE` statement sets the
+nullable foreign key column to `NULL` before the rows of the cycle are
+deleted. Cycles whose foreign keys are all non-nullable keep throwing
+`CycleDetectedException`. If your application catches that exception for
+cycles that involve nullable foreign keys, adjust it to expect the deletions
+(including the extra `UPDATE`) to succeed.
+
 # Upgrade to 3.6
 
 ## Deprecate using string expression for default values in mappings
